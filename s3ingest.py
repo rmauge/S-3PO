@@ -6,8 +6,8 @@ the processes at different times. This helps to reduce contention by the nodes.
 Run using 'python s3ingest --config ${CONF_FILE_PATH} --node ${NODE}'
 Multipart upload based on https://github.com/boto/boto/blob/develop/bin/s3multiput
 
-Requires: Python 2.6.5
-          boto 2.3.0: A Python interface to Amazon Web Services
+Requires: Python 2.7
+          boto 2.2.0: A Python interface to Amazon Web Services
           Pyinotify 0.9.3: monitor filesystem events with Python under Linux
           filechunkio 1.5
 
@@ -24,8 +24,8 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 @author: Raymond Mauge
-$Date: 2012-10-01 12:56:55 -0400 (Mon, 01 Oct 2012) $
-$Revision: 69 $
+$Date: 2012-10-09 18:15:52 -0400 (Tue, 09 Oct 2012) $
+$Revision: 77 $
 """
 
 from Queue import Empty, Queue
@@ -33,13 +33,13 @@ from boto.exception import S3ResponseError
 from boto.pyami.config import Config
 from boto.s3.connection import S3Connection
 from boto.s3.key import Key
+from boto import utils
 from filechunkio import FileChunkIO
 from logging import handlers
 from multiprocessing import Pool
 from threading import Thread
 from time import sleep
 import argparse
-import boto
 import fcntl
 import logging
 import math
@@ -48,28 +48,31 @@ import pyinotify
 import signal
 import stat
 import sys
-import threading
 import time
 import traceback
 
 #Default filename for the config file
 CONFIG_FILE = './s3ingest.conf'
+access_key_id = None # needed global because multiprocessing cannot pickle certain objects
+secret_access_key = None # needed global because multiprocessing cannot pickle certain objects
 
 # Must be global to be passed around
 def upload_progress_cb(bytes_so_far, total_bytes):
-    logging.info("{0:d} bytes transferred / {1:d} bytes".format(bytes_so_far, total_bytes))
+    logging.info("{0:d} / {1:d} bytes transferred".format(bytes_so_far, total_bytes))
 
 # Must be global to be passed around
-def _upload_part(target_bucket, multipart_id, part_num, file_path, offset, bytes, amount_of_retries=10):
+def _upload_part(target_bucket_name, multipart_id, part_num, file_path, offset, bytes, amount_of_retries=10):
     cb = upload_progress_cb
     
     def _upload(retries_left=amount_of_retries):
         try:
             logging.info("Start uploading part #{0:d} of {1}".format(part_num, file_path))
+            target_bucket = S3Connection(access_key_id, secret_access_key).get_bucket(target_bucket_name)
             for mp in target_bucket.get_all_multipart_uploads():
                 if mp.id == multipart_id:
                     with FileChunkIO(file_path, 'r', offset=offset, bytes=bytes) as fp:
-                        mp.upload_part_from_file(fp=fp, part_num=part_num, cb=cb, num_cb=5)
+                        hex_digest, base64_digest, data_size = utils.compute_md5(fp, size=bytes)
+                        mp.upload_part_from_file(fp=fp, part_num=part_num, cb=cb, num_cb=1,  md5=(hex_digest, base64_digest))
                     break
         except Exception, exc:
             if retries_left:
@@ -98,7 +101,7 @@ class S3Util:
     _exit_flag = False
     _active_flag = False
     _file_split_threshold_bytes = 100 * 1024 * 1024 #Max file size bytes before upload is done in separate parts
-    _parallel_processes = 4 #Number of processes for uploading parts
+    _parallel_processes = 2 #Number of processes for uploading parts
 
     def __init__(self, access_key_id, secret_access_key):
         self._AWS_ACCESS_KEY_ID = access_key_id
@@ -110,8 +113,7 @@ class S3Util:
         logging.debug("Connected to S3")
     
     def get_connection(self):
-        s3_connection = S3Connection(self._AWS_ACCESS_KEY_ID, self._AWS_SECRET_ACCESS_KEY)
-        return s3_connection     
+        return S3Connection(self._AWS_ACCESS_KEY_ID, self._AWS_SECRET_ACCESS_KEY)   
 
     def start_monitoring(self, dir_name):
         self._watched_dir_offset = len(dir_name)
@@ -129,20 +131,26 @@ class S3Util:
         for bucket in bucket_rs:
             print "Bucket found: {0}".format(bucket.name)
 
-    def list_keys(self, bucket_name, path):
+    def list_keys(self, bucket_name, path, min_size_bytes=0, max_size_bytes=sys.maxint):
         bucket = self.get_connection().get_bucket(bucket_name)
         bucket_list = bucket.list(path)
-        print "Keys in bucket {0}, path {1}".format(bucket_name, path)
-        for key_list in bucket_list:
-            key = str(key_list.key)
-            print "{0}: {1} ".format(bucket_name, key)
+        print "Keys in bucket {0}, path {1}, greater than {2} bytes and less than {3} bytes".format(bucket_name, path, min_size_bytes, max_size_bytes)
+        for key in bucket_list:
+            if (key.size >= min_size_bytes ) and (key.size <= max_size_bytes):
+                print "{0}: {1} ".format(bucket_name, key.name)
             
     def set_target_bucket_name(self, target_bucket_name):
         self._target_bucket_name = target_bucket_name
         
+    def get_target_bucket_name(self):
+        return self._target_bucket_name
+
     def get_target_bucket(self):
         return self.get_connection().get_bucket(self._target_bucket_name)
-        
+      
+    def get_bucket(self, bucket_name):
+        return self.get_connection().get_bucket(bucket_name)
+      
     def multipart_upload_file(self, file_path, keyname):
         mp = self.get_target_bucket().initiate_multipart_upload(keyname, headers={}, reduced_redundancy=False)
         
@@ -157,7 +165,7 @@ class S3Util:
             remaining_bytes = source_size - offset
             bytes = min([bytes_per_chunk, remaining_bytes])
             part_num = i + 1
-            pool.apply_async(_upload_part, [self.get_target_bucket(), mp.id, part_num, file_path, offset, bytes])
+            pool.apply_async(_upload_part, [self.get_target_bucket_name(), mp.id, part_num, file_path, offset, bytes])
         pool.close()
         pool.join()
             
@@ -178,7 +186,9 @@ class S3Util:
         if os.path.isfile(file_path) and os.stat(file_path).st_size > self._file_split_threshold_bytes:
             self.multipart_upload_file(file_path, key.key)
         else:
-            key.set_contents_from_filename(file_path)
+            fp = open(file_path, "r")
+            hex_digest, base64_digest, data_size = utils.compute_md5(fp)
+            key.set_contents_from_filename(file_path, cb=upload_progress_cb, num_cb=1, md5=(hex_digest, base64_digest))
 
         # Check in queue since the same file path may have been added again while this one was uploading    
         if os.path.isfile(file_path) and not self.is_queued(file_path):
@@ -189,6 +199,9 @@ class S3Util:
         return self._queue.get(timeout=5)
 
     def add_to_queue(self, file_path):
+        if os.path.isfile(file_path) and not os.path.getsize(file_path) > 0:
+            logging.error("Got zero-byte file, {0}, (ignoring)".format(file_path))
+            return
         if not self.is_queued(file_path):
             self._queue.put(file_path)
 
@@ -305,6 +318,8 @@ def main(argv):
 
     current_defaults_filename = os.path.join(os.path.dirname(os.path.abspath(__file__)), parameters.config_filename)
     config = Config(path=current_defaults_filename)
+    global access_key_id
+    global secret_access_key
     access_key_id = config.get('Amazon', 'aws_access_key_id')
     secret_access_key = config.get('Amazon', 'aws_secret_access_key')
     log_file_path = config.get('General', 'log_file_path', '/var/log/s3ingest.log')
@@ -331,7 +346,7 @@ def main(argv):
     smtp_handler = handlers.SMTPHandler(mailhost, fromaddr, toaddrs, 'S3Util error occurred')
     smtp_handler.setLevel(logging.ERROR)
     logging.getLogger().addHandler(smtp_handler)
-
+    
     s3_util = S3Util(access_key_id, secret_access_key)
 
     s3_util.set_target_bucket_name(target_bucket_name)
@@ -393,7 +408,7 @@ def main(argv):
         logging.debug("Released lock")
         pid_file.close()
         #Play nice
-        sleep(1)
+        sleep(5)
 
     s3_util.wait_for_completion()
     logging.debug("Exiting")
